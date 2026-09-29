@@ -70,7 +70,6 @@ Two sites, each behind its own OPNsense firewall, joined by an **encrypted IPsec
 - `*-presentation.pdf` — the theory slide deck
 - `implementation.txt` — concise build steps
 - `implementation-guide.md` *(Phase 4)* — a detailed hands-on runbook with verification gates
-- `theory-video-script.txt` / `implementation-video-script.txt` *(Phase 4)* — narration for the walkthrough videos
 - `images/` — topology diagrams and IP tables
 
 ---
