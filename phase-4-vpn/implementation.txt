@@ -1,0 +1,215 @@
+========================================================
+   SOC LAB - PHASE 4 IMPLEMENTATION (DUAL-FIREWALL + VPN)
+   Two OPNsense sites | IPsec site-to-site tunnel (IKEv2/ESP)
+   SITE A (SOC)  <== encrypted transit ==>  SITE B (BRANCH)
+   Detection at the DECRYPTION POINT | Verify: sensor + Grafana
+========================================================
+
+WHAT CHANGED FROM PHASE 3
+  Phase 3 = one firewall, three zones, Source NAT breaking attribution.
+  Phase 4 adds a SECOND site behind its OWN firewall and joins the two
+  sites with an ENCRYPTED IPsec tunnel across an untrusted transit.
+  The new problem: once traffic is encrypted, a signature engine on the
+  wire has nothing to read - no ports, no flags, no payload, only ESP.
+  Detection has to MOVE to the point where the firewall decrypts.
+
+TOPOLOGY (two firewalls, one tunnel, one middle segment)
+  TRANSIT   (WAN em0, intnet "vlan20")  10.10.0.0/24
+       fw-a WAN .1     fw-b WAN .2     vyos (passive) + KALI (on-path)
+  SITE A - SOC (fw-a)
+       LAN  (em1)  10.10.10.0/24   client .50 + SOC          gw .1
+            SOC: wazuh .20  zabbix .22  velo .23  grafana .24
+       DMZ  (em2)  10.10.20.0/24   server A(web) .60, honeypot .70  gw .1
+       Sensor:     passive tap (promisc) on Site A LAN = DECRYPTION POINT
+  SITE B - BRANCH (fw-b)
+       LAN         10.10.30.0/24   branch attacker .40       gw .1
+  Management:      192.168.56.x    fw-a .9   fw-b .13   (out-of-band)
+
+  TUNNEL SELECTORS   10.10.10.0/24 (A)  <==>  10.10.30.0/24 (B)
+  CRYPTO             IKEv2 · AES-GCM · SHA-256 · PSK
+  KEY IDEA           the tunnel is the ONLY path branch->SOC, and it
+                     crosses the transit SEALED.
+
+
+--------------------------------------------------------
+PART 1 - REACH BOTH FIREWALL GUIs (out-of-band)
+--------------------------------------------------------
+Each firewall is managed on the management network only, never from the
+transit:
+  fw-a:  https://192.168.56.9     (login: root)
+  fw-b:  https://192.168.56.13    (login: root)
+
+Say: "Two independent firewalls, each managed on its own out-of-band
+leg. Neither exposes management to the transit."
+
+GOTCHA: the VirtualBox VM console corrupts special characters
+( { } _ = " ) on paste with a non-US keyboard layout - every swanctl
+config typed at the console got a syntax error. Type tunnel config in
+the browser GUI (host keyboard) or push files over SSH, never the VM
+console.
+
+
+--------------------------------------------------------
+PART 2 - THE TRANSIT + WAN ADDRESSING
+--------------------------------------------------------
+Both firewall WANs sit on the SAME L2 transit segment (intnet
+"vlan20", 10.10.0.0/24). They ARP each other directly; vyos is a
+passive middle-box, it does NOT route between them.
+
+  fw-a  Interfaces -> WAN  = 10.10.0.1/24
+  fw-b  Interfaces -> WAN  = 10.10.0.2/24
+
+GOTCHA: 10.10.0.0/24 is a PRIVATE range. WAN "Block private networks"
+will silently drop the peer's IKE. Turn it OFF on both WANs.
+
+Prove the peers see each other (from fw-a shell):
+  ping -c2 10.10.0.2         # fw-b WAN  -> reply
+
+Say: "Both firewalls face the same untrusted transit. To each other
+they're just a peer IP across the wire."
+
+
+--------------------------------------------------------
+PART 3 - THE IPsec TUNNEL (IKEv2 / ESP, PSK)
+--------------------------------------------------------
+Site-to-site tunnel joining the two LANs. Same parameters BOTH ends.
+
+  Local / Remote     fw-a 10.10.0.1  <->  fw-b 10.10.0.2
+  Key exchange       IKEv2
+  Authentication     Pre-Shared Key   (identical string both ends)
+  Phase 1 / Phase 2  AES-GCM · SHA-256
+  Child selectors    10.10.10.0/24 (A)  <->  10.10.30.0/24 (B)
+
+fw-a side (driven over SSH as swanctl conf.d files):
+  /usr/local/etc/swanctl/conf.d/tunnel.conf     connection "labtun"
+      local_addrs 10.10.0.1 · remote_addrs 10.10.0.2 · NO explicit ids
+      (identity defaults to the address) · child "labchild" selectors
+  /usr/local/etc/swanctl/conf.d/labsecret.conf  the PSK (%any)
+  Load + start:
+      swanctl --load-all
+      swanctl --initiate --child labchild
+      swanctl --list-sas          # expect ESTABLISHED / INSTALLED
+
+fw-b side (driven in the GUI - console mangles the config):
+  VPN -> IPsec connection "site-b-to-a"
+      Pre-Shared Key = the same PSK string
+      Remote authentication ID = 10.10.0.1   (the PEER's address)
+
+THE GOTCHAS THAT BLOCKED THE TUNNEL (in order found):
+  1) Leftover manual conf.d/*.conf from the old build loaded phantom
+     connections with old addressing - delete them first.
+  2) No Pre-Shared Key SECRET actually existed - the GUI said "auth
+     psk" but the Pre-Shared Keys list was empty  ->  "no shared key
+     found". Create the secret explicitly.
+  3) Mirrored remote-ID bug: each firewall had BOTH its local AND
+     remote auth id set to its OWN address  ->  each rejected the
+     other  ->  AUTHENTICATION_FAILED. Fix: remote id = the PEER's
+     address (fw-a remote -> .0.2, fw-b remote -> .0.1), or use a
+     swanctl connection with NO explicit id (defaults to the address).
+
+Say: "The tunnel only comes up when identity, key, and the exact pair
+of networks match on both ends. ESP is protocol 50, not a port."
+
+
+--------------------------------------------------------
+PART 4 - PASS THE TUNNEL TRAFFIC (WAN rules + routes)
+--------------------------------------------------------
+Tunnel UP is not the same as traffic FLOWING. Two things still block it.
+
+  a) The auto-generated WAN "IPsec IKE/ESP" rules still referenced the
+     OLD peer address and can't be edited (link-icon only). fw-a was
+     dropping inbound ESP from 10.10.0.2 (found via
+     tcpdump -nei pflog0  ->  "rule 8 block in on em1 ... ESP").
+     FIX: add a plain WAN PASS rule on BOTH firewalls -
+          protocol any, source "WAN network" (= 10.10.0.0/24), dest any.
+
+  b) Each end host needs a route to the FAR LAN via its own firewall:
+        Site A client:   ip route add 10.10.30.0/24 via 10.10.10.1
+        Branch attacker: ip route add 10.10.10.0/24 via 10.10.30.1
+
+Prove branch <-> SOC across the sealed tunnel:
+  # branch attacker .30.40:
+  ping -c4 10.10.10.50        # reply, TTL 62 = crossed BOTH firewalls
+
+Say: "The round trip has a TTL of sixty-two - it passed through two
+firewalls and rode the encrypted tunnel across the transit."
+
+
+--------------------------------------------------------
+PART 5 - DETECTION AT THE DECRYPTION POINT
+--------------------------------------------------------
+The branch attacker attacks Site A THROUGH the tunnel. fw-a decrypts;
+the Site A sensor reads the traffic in the clear.
+
+=== nmap over the VPN ===
+  # branch attacker .30.40:
+  nmap -sS 10.10.10.50
+  # Site A sensor:
+  sudo tail -60 /var/log/suricata/eve.json | jq -r 'select(.event_type=="alert") | "\(.src_ip) -> \(.dest_ip) | \(.alert.signature)"'
+  PASS = LOCAL NMAP SYN scan + connect/version sweep, naming the REAL
+         src 10.10.30.40  (inter-site tunnel is NOT NAT'd - attribution
+         survives the VPN).
+
+=== Nikto over the VPN ===
+  # branch attacker .30.40:
+  nikto -h http://10.10.10.50
+  # Site A sensor:
+  ->  6x LAB LFI attempt (/etc/passwd in the URL - our Phase 3 rule)
+      + ET WEB_SPECIFIC_APPS signature, all src 10.10.30.40
+
+Say: "A signature written two phases ago fired on a scanner that
+arrived encrypted - because by the time the sensor saw it, the firewall
+had already decrypted it."
+
+
+--------------------------------------------------------
+PART 6 - BLIND ON THE WIRE (the confidentiality proof)
+--------------------------------------------------------
+The SAME scan, watched from the transit (the on-path / KALI seat):
+  # transit tap (sensor enp0s8, or tcpdump on vyos/KALI):
+  sudo tcpdump -nei <transit-if> esp
+  ->  10.10.0.2 > 10.10.0.1: ESP(spi=0x...), length 80
+      10.10.0.1 > 10.10.0.2: ESP(spi=0x...), length 76   ...
+
+  NO ports. NO flags. NO 10.10.30.40. NO scan pattern. Only ESP between
+  two firewall addresses. The man-in-the-middle sees THAT the firewalls
+  are talking (when, how much) and nothing else.
+
+Say: "From the attacker's own seat on the wire, the scan is invisible.
+This is the confidentiality of the VPN, proven live."
+
+
+--------------------------------------------------------
+PART 7 - CORRELATION (the unmask)
+--------------------------------------------------------
+Two half-truths, same timestamp:
+  Transit (on-path)  ->  encrypted surge  fw-b .0.2  <->  fw-a .0.1
+                         = WHEN + HOW MUCH
+  Site A sensor      ->  10.10.30.40 scanned 10.10.10.50
+                         = WHO + WHAT
+
+Neither alone tells the story. Align them by time: the encrypted surge
+on the transit IS the scan the sensor decoded. The branch attacker,
+hidden inside the tunnel, is unmasked.
+
+Say: "Once traffic is encrypted, no single log is authoritative.
+Correlating the encrypted-flow metadata on the wire with the decrypted
+detection inside the site is the skill Phase 4 teaches."
+
+
+--------------------------------------------------------
+KEY FILES (Phase 4)
+--------------------------------------------------------
+  /usr/local/etc/swanctl/conf.d/tunnel.conf    (fw-a) connection labtun
+  /usr/local/etc/swanctl/conf.d/labsecret.conf (fw-a) the PSK secret
+  /conf/config.xml               (both firewalls) interfaces/rules/IPsec
+  /var/log/suricata/eve.json     (Site A sensor)  decrypted-point alerts
+  /var/lib/suricata/rules/local.rules            LOCAL NMAP + LAB LFI sigs
+  swanctl --list-sas / --list-conns              tunnel state (no
+                                                 --list-secrets on this ver)
+
+  ACCESS: ssh fw-a works (root, key soclab_key). ssh fw-b is DENIED -
+  fw-b is driven from its GUI/console only. OPNsense root shell is csh
+  (no 2>&1 / 2>/dev/null; push files with  cat local | ssh fw-a 'cat > /path').
+
+SNAPSHOT: phase4-vpn (fw-a + fw-b + attacker, cold).

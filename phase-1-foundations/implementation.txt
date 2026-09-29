@@ -1,0 +1,139 @@
+========================================================
+   SOC LAB - PHASE 1 IMPLEMENTATION RUNBOOK
+   Attacker: 10.10.10.40 | Attacks over 10.10.10.x
+   Verify: log proof + Grafana ("Last 15 minutes")
+========================================================
+
+Note: Drive attacks by SSH into the attacker/mgmt boxes.
+The Windows host cannot reach labnet directly (by design).
+
+
+--------------------------------------------------------
+PART 1 - THE 5 PLANES ARE ALIVE
+--------------------------------------------------------
+
+Endpoint (Wazuh) - list agents, all Active:
+  ssh soc@192.168.56.20 "sudo /var/ossec/bin/agent_control -l"
+
+Network (Suricata + Zeek):
+  ssh soc@192.168.56.10 "systemctl is-active suricata zeek"
+
+Availability (Zabbix):
+  ssh soc@192.168.56.22 "systemctl is-active zabbix-server"
+
+Forensic (Velociraptor):
+  ssh soc@192.168.56.23 "systemctl is-active velociraptor"
+
+Deception (Cowrie honeypot):
+  ssh soc@10.10.10.70 "systemctl is-active cowrie"
+
+Say: "Five planes, all reporting in - one pane of glass."
+
+
+--------------------------------------------------------
+PART 2 - ATTACK SIMULATION (log proof + dashboard each)
+--------------------------------------------------------
+
+=== ATTACK 1 - PORT SCAN (Reconnaissance) ===
+
+Run:
+  ssh soc@10.10.10.40 "ping -c 3 10.10.10.30; sudo nmap -sV -p- 10.10.10.30"
+
+Proof 1 - SENSOR (Zeek: distinct ports hit, ~1000):
+  ssh soc@192.168.56.10 'sudo grep 10.10.10.40 /opt/zeek/logs/current/conn.log | jq -r ".\"id.resp_p\"" | sort -un | wc -l'
+
+Proof 2 - GRAFANA:
+  03 Network -> ICMP "LAB TEST" alert + scan burst from 10.10.10.40
+
+
+=== ATTACK 2 - SSH BRUTE-FORCE -> HONEYPOT (Intrusion) ===
+
+Run (real sshd on port 2022 -> fires rule 5712):
+  ssh soc@10.10.10.40 'for i in $(seq 1 12); do ssh -p 2022 -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=2 baduser$i@10.10.10.70 true 2>/dev/null; done; echo done'
+
+Proof 1 - LOG (honeypot auth.log failures):
+  ssh soc@10.10.10.70 'sudo grep "Failed password\|Invalid user" /var/log/auth.log | tail -10'
+
+Proof 2 - GRAFANA:
+  02 Incidents -> Rule 5712 brute-force, level 10,
+  Src 10.10.10.40, Target honeypot, MITRE Brute Force
+
+
+=== ATTACK 3 - MALWARE DROP -> FIM + VIRUSTOTAL (Installation) ===
+
+Run:
+  ssh soc@10.10.10.30 'echo WDVPIVAlQEFQWzRcUFpYNTQoUF4pN0NDKTd9JEVJQ0FSLVNUQU5EQVJELUFOVElWSVJVUy1URVNULUZJTEUhJEgrSCo= | base64 -d > /tmp/eicar.com; ls -la /tmp/eicar.com'
+
+Proof 1 - WAZUH MANAGER (endpoint log):
+  ssh soc@192.168.56.20 'sudo grep -E "/tmp/eicar|virustotal" /var/ossec/logs/alerts/alerts.log | tail -15'
+
+Proof 2 - GRAFANA:
+  04 Endpoint/File -> FIM file-added (554) + VirusTotal 64/67 (87105)
+
+
+--------------------------------------------------------
+PART 3 - PAYOFF: ONE TIMELINE
+--------------------------------------------------------
+
+Walk the dashboards:
+  01 SOC Overview  -> all 3 attacks as spikes
+  02 Incidents     -> brute-force
+  03 Network       -> scan
+  04 Endpoint/File -> malware
+  05 SOC Health    -> all planes green
+
+Say: "Three attacks, four planes, one timeline. Every stage
+detected and traceable to Time, Source, Host, and Action.
+Phase 1: validated."
+
+
+--------------------------------------------------------
+TWO-PROOF MATRIX
+--------------------------------------------------------
+
+Attack 1 Scan       | Sensor Zeek conn.log (~1000 ports) | 03 Network
+Attack 2 Brute-force| Honeypot auth.log                  | 02 Incidents (rule 5712)
+Attack 3 Malware    | Wazuh alerts.log                   | 04 Endpoint/File (554+87105)
+
+
+--------------------------------------------------------
+DEVICE IP REFERENCE
+--------------------------------------------------------
+
+VM            labnet(attacks)  mgmt(SSH)      Plane
+wazuh         10.10.10.20      192.168.56.20  Endpoint
+zabbix        10.10.10.22      192.168.56.22  Availability
+velociraptor  10.10.10.23      192.168.56.23  Forensic
+grafana       10.10.10.24      192.168.56.24  Visualization
+throwaway     10.10.10.30      192.168.56.30  Victim/agent
+attacker      10.10.10.40      (console)      Red-team
+honeypot      10.10.10.70      (labnet)       Deception
+sensor        none (tap)       192.168.56.10  Network
+
+
+--------------------------------------------------------
+UTILITY COMMANDS
+--------------------------------------------------------
+
+Re-sync all VM clocks (UTC = Bahrain time - 3h):
+  $all = @("192.168.56.20","192.168.56.10","192.168.56.22","192.168.56.23","192.168.56.24","10.10.10.70","10.10.10.40","10.10.10.30")
+  foreach ($ip in $all) { ssh soc@$ip 'sudo timedatectl set-ntp false; sudo date -s "2026-09-07 HH:MM:00"; date' }
+
+Check labnet reachability (from wazuh):
+  ssh soc@192.168.56.20 'for ip in 10.10.10.20 10.10.10.22 10.10.10.23 10.10.10.24 10.10.10.30 10.10.10.40 10.10.10.70; do ping -c1 -W1 $ip >/dev/null 2>&1 && echo "$ip OK" || echo "$ip FAIL"; done'
+
+Restore + cold-boot all VMs from snapshot:
+  $env:Path += ";C:\Program Files\Oracle\VirtualBox"
+  $vms = "wazuh","sensor","zabbix","velociraptor","grafana","throwaway","honeypot","attacker"
+  foreach ($vm in $vms) { VBoxManage controlvm $vm poweroff 2>$null }
+  Start-Sleep 5
+  foreach ($vm in $vms) { VBoxManage snapshot $vm restore "phase1-ready-to-record"; VBoxManage discardstate $vm 2>$null; VBoxManage startvm $vm --type headless }
+
+Graceful shutdown all VMs:
+  $env:Path += ";C:\Program Files\Oracle\VirtualBox"
+  $vms = "wazuh","sensor","zabbix","velociraptor","grafana","throwaway","honeypot","attacker"
+  foreach ($vm in $vms) { VBoxManage controlvm $vm acpipowerbutton 2>$null }
+
+Latest snapshot name: phase1-ready-to-record
+
+========================================================

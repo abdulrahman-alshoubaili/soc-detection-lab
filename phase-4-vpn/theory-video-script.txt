@@ -1,0 +1,256 @@
+================================================================
+   SOC DETECTION LAB — PHASE 4   ·   THEORY VIDEO NARRATION (14 slides)
+   Presenter: intern, Nuetel Communications
+   [CUE] = on screen (matches phase4-presentation deck).
+   Plain text = what you say.
+   ~11 min at a measured pace.  Companion: the practical/demo video.
+================================================================
+
+
+SLIDE 1 — TITLE
+[CUE: "Phase 4 — Dual-Firewall Network & a Site-to-Site VPN"]
+
+"This is Phase 4 of the SOC lab, and it's the last one. Phase 1 asked:
+can we see? Phase 2: can we see across a router? Phase 3: can we still
+trust what we see once a firewall rewrites addresses? Phase 4 asks the
+hardest question of all — we encrypt the traffic, so the SOC can no
+longer read it on the wire, and we ask: can we still detect the attack?
+
+This video is the theory. A second video will walk through building it
+and running the attacks live."
+
+
+SLIDE 2 — OBJECTIVES
+[CUE: "What Phase 4 does" — four points]
+
+"Four things happen in this phase. We add a second site — a branch
+office behind its own firewall. We join the two sites with an encrypted
+IPsec VPN across an untrusted transit. We carry the branch's traffic
+back to the central SOC, the way a real remote office reports home. And
+then we attack — from inside the branch, and from on the wire in the
+middle — and we see where the SOC can still catch it.
+
+That's the whole through-line of the lab in one sentence: can we see,
+across a router, once a firewall lies, and now — once the traffic is
+encrypted."
+
+
+SLIDE 3 — THE CORE CHANGE
+[CUE: routed link vs encrypted VPN, two cards]
+
+"So what actually changes. On the left is what we had: a routed link. It
+moves packets between networks, and anyone on the path can read every
+packet — the ports, the flags, the payload, all in the clear. Our sensor
+sees the traffic directly.
+
+On the right is the VPN. It wraps each packet inside an encrypted one.
+Now anyone on the path sees only an ESP blob between two firewalls. The
+ports, the flags, the payload — all sealed inside.
+
+A VPN is just a routed link that first seals every packet. It protects
+that packet from the wire — and, as a side effect, it hides it from our
+own defenders."
+
+
+SLIDE 4 — TOPOLOGY
+[CUE: Site A ↔ Transit ↔ Site B diagram]
+
+"Here's the layout with real addresses. On the left, Site A — the SOC.
+It still has its Intranet, ten-ten-ten, and its DMZ, ten-ten-twenty,
+with all the monitoring tools and the sensor tap.
+
+On the right, Site B — the branch — on ten-ten-thirty, behind its own
+firewall, with an attacker inside it.
+
+In the middle is the transit, ten-ten-zero. That's the untrusted
+segment — it stands in for the internet — and it carries the two
+firewall WAN addresses, a passive router, and a seat for an on-path
+attacker.
+
+The dashed line is the IPsec tunnel. It joins the two LANs, and it is
+the only path a branch host takes to reach the SOC — crossing that
+untrusted middle sealed."
+
+
+SLIDE 5 — THE IP TABLE
+[CUE: addressing table, two columns]
+
+"The full addressing. Site A on the left: the firewall fw-a with its
+three legs, the SIEM on ten-ten-ten-twenty, Grafana on twenty-four, the
+client, and the sensor tap. Transit and Site B on the right: the two
+firewall WAN addresses that terminate the tunnel — ten-ten-zero-one and
+ten-ten-zero-two — the transit router, the on-path attacker seat, and
+the branch firewall fw-b with its attacker on ten-ten-thirty-forty.
+
+The tunnel joins ten-ten-ten-zero and ten-ten-thirty-zero, using IKEv2
+and AES-GCM. And, as in every phase, management is out-of-band on the
+one-ninety-two network, so admin never touches the traffic we watch."
+
+
+SLIDE 6 — THE TECHNOLOGIES
+[CUE: four cards — two firewalls, transit, the tunnel, tools]
+
+"The pieces that build it. Two firewalls — both OPNsense: fw-a at the
+SOC and fw-b at the branch. Each is stateful, and each terminates one
+end of the tunnel and enforces its own site's policy.
+
+The transit is a VyOS router, playing the part of the internet — the
+untrusted segment the tunnel has to cross.
+
+The tunnel itself is IPsec, built with strongSwan: IKEv2 for the key
+exchange, AES-GCM for the encryption, and a pre-shared key for
+authentication.
+
+And the detection stack is the same one we've built all along — Suricata
+and Zeek on the sensor, Wazuh, Grafana — plus nmap and Nikto as the
+attacker's tools. One new idea, three new parts: a second firewall, an
+untrusted transit, and an encrypted tunnel between them."
+
+
+SLIDE 7 — HOW THE TUNNEL WORKS
+[CUE: IKE + ESP, the swanctl summary block]
+
+"How the tunnel actually comes up. There are two stages. IKE is the
+handshake: the two firewalls authenticate each other with the shared
+key, and agree on secret keys. That's done once, and refreshed on a
+timer. Then ESP carries the traffic: every real packet is encrypted with
+those keys and wrapped as ESP. That's the continuous flow.
+
+It runs in tunnel mode, which means the whole original packet is sealed
+inside — only the firewall-to-firewall header shows on the outside.
+
+Two things have to line up or it simply won't come up: both ends must
+agree on identity, on the key, and on the exact pair of networks. And
+one detail that trips everyone — ESP is a protocol, number fifty, not a
+port. So the firewall has to be told to permit the protocol, not a port
+number."
+
+
+SLIDE 8 — THE CORE QUESTION
+[CUE: "Encryption hides the attack from everyone — including your defenders"]
+
+"Now the problem this phase exists for. Encryption is doing exactly what
+it's supposed to — but it hides the attack from everyone, including us.
+
+Our detection engine works by matching ports, flags, and payloads.
+Inside the tunnel there are none of those to read — just an opaque ESP
+blob between two firewalls.
+
+So the question is simple to say and hard to answer: how do you catch an
+attacker you cannot read?"
+
+
+SLIDE 9 — THE ANSWER: TWO VIEWS
+[CUE: two cards — on the transit vs at the decryption point]
+
+"The answer is that where you watch matters more than ever, and there
+are two very different places to watch.
+
+On the transit — in the middle — you get only ESP. No ports, no flags,
+no payload. Content inspection is dead. All you have left is traffic
+analysis: the timing, the size, the regularity. You learn that something
+happened, not what.
+
+At the decryption point — inside the site — it's the opposite. Once fw-a
+decrypts the tunnel, the packets are in the clear again. Signatures
+work. The sensor reads the whole attack, and it names the real source —
+because traffic between the two sites inside the tunnel is not
+NAT'd, so attribution survives.
+
+The blindness lives only inside the tunnel. Detection just moves to where
+the firewall hands the traffic back in the clear."
+
+
+SLIDE 10 — TWO ATTACKERS
+[CUE: two cards — branch attacker vs transit attacker]
+
+"To test both halves of that, we use two attackers.
+
+The first is inside Branch B, on ten-ten-thirty-forty. It rides the
+trusted VPN straight into the SOC. Because it's decrypted at
+headquarters, it is detectable — with the real branch IP named. This one
+proves a VPN does not vet a threat that comes from a trusted branch.
+
+The second sits on the transit — the on-path attacker. It scans the
+tunnel from the wire and sees only ESP. This one proves the opposite:
+that the VPN's confidentiality holds, and the man-in-the-middle is blind.
+
+One attacker tests what the VPN lets through; the other tests what the
+VPN hides."
+
+
+SLIDE 11 — CAUGHT AT THE DECRYPTION POINT
+[CUE: nmap + Nikto evidence, real source .30.40]
+
+"Here's the first attacker's result. From the branch, we ran an nmap
+scan and a Nikto web scan against the SOC. Both rode the tunnel, were
+decrypted at fw-a, and lit up the Site A sensor.
+
+The nmap scan fired our SYN-scan and sweep rules. The Nikto scan fired
+the local-file-inclusion rule we wrote back in Phase 3 — six times — plus
+a known web-app signature.
+
+And look at the source on every one of them: ten-ten-thirty-forty. The
+real branch attacker. A signature we wrote two phases ago just caught a
+scanner that arrived fully encrypted — because by the time the sensor saw
+it, the firewall had already decrypted it."
+
+
+SLIDE 12 — BLIND ON THE WIRE
+[CUE: transit capture — ESP only]
+
+"Now the second attacker's view — the exact same scan, captured on the
+transit at the same moment.
+
+All you see is ESP: encrypted blobs going between ten-ten-zero-two and
+ten-ten-zero-one. No ports. No flags. No ten-ten-thirty-forty. No scan
+pattern at all. Only two firewalls exchanging sealed envelopes.
+
+From the attacker's own seat on the wire, the scan is invisible. This is
+the confidentiality of the VPN, proven from the inside."
+
+
+SLIDE 13 — CORRELATION
+[CUE: two-row table — transit vs sensor — aligned by time]
+
+"So we have two witnesses to one attack, and each one only knows half of
+it.
+
+The transit knows when the firewalls exchanged a burst of encrypted
+traffic, and how much — but not what it was. The Site A sensor knows who
+and what — the branch attacker scanning an internal host — but not that
+it crossed an untrusted wire.
+
+Neither one alone tells the story. But line them up by timestamp, and the
+encrypted surge on the wire is the same scan the sensor decoded a moment
+later. Put together, the branch attacker who was hidden inside the tunnel
+is fully unmasked.
+
+That's the lesson: once traffic is encrypted, no single log is
+authoritative. Correlating across the boundary is the skill this phase
+teaches."
+
+
+SLIDE 14 — VERDICT
+[CUE: "PHASE 4 — PASSED"]
+
+"So, Phase 4 — passed.
+
+We joined two sites with a real encrypted tunnel. We caught an attacker
+who came in through a trusted branch, and named them, at the point where
+the firewall decrypts. We watched the same attack out on the wire and saw
+nothing but ESP. And we unmasked the attacker by correlating the two
+views.
+
+The phase in one line: encryption blinds the middle; the decryption point
+restores sight; correlation names the attacker.
+
+That completes the four-phase lab. The next video is the practical part —
+building this tunnel and running these attacks live. Thanks for watching."
+
+================================================================
+   PACING: ~11 min.  Keep slides 8-13 slow — that's the argument.
+   Real source to stress: branch attacker 10.10.30.40.
+   Tunnel endpoints on the wire: fw-a 10.10.0.1 · fw-b 10.10.0.2 (ESP).
+   Sensor = Site A LAN = the decryption point.
+================================================================

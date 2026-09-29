@@ -1,0 +1,9 @@
+# large walkthrough videos are recorded separately, not stored in git
+*.mp4
+*.mov
+*.mkv
+# os / editor cruft
+Thumbs.db
+.DS_Store
+*.tmp
+~$*

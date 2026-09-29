@@ -1,0 +1,21 @@
+Segment,Network,Host,Role,IP
+Site A - SOC - Intranet (LAN),10.10.10.0/24,fw-a,firewall - LAN gateway,10.10.10.1
+Site A - SOC - Intranet (LAN),10.10.10.0/24,wazuh,SIEM manager,10.10.10.20
+Site A - SOC - Intranet (LAN),10.10.10.0/24,zabbix,availability,10.10.10.22
+Site A - SOC - Intranet (LAN),10.10.10.0/24,velociraptor,endpoint forensics,10.10.10.23
+Site A - SOC - Intranet (LAN),10.10.10.0/24,grafana,dashboards,10.10.10.24
+Site A - SOC - Intranet (LAN),10.10.10.0/24,client,internal host / target,10.10.10.50
+Site A - SOC - Intranet (LAN),10.10.10.0/24,sensor,Suricata/Zeek tap - decryption point,tap (passive)
+Site A - SOC - DMZ,10.10.20.0/24,fw-a,firewall - DMZ gateway,10.10.20.1
+Site A - SOC - DMZ,10.10.20.0/24,server A,web server (bait app),10.10.20.60
+Site A - SOC - DMZ,10.10.20.0/24,honeypot,Cowrie deception,10.10.20.70
+Transit - untrusted middle,10.10.0.0/24,fw-a WAN,Site A tunnel endpoint,10.10.0.1
+Transit - untrusted middle,10.10.0.0/24,fw-b WAN,Site B tunnel endpoint,10.10.0.2
+Transit - untrusted middle,10.10.0.0/24,vyos,transit router (passive),10.10.0.x
+Transit - untrusted middle,10.10.0.0/24,KALI,on-path attacker - sees ESP only,10.10.0.x
+Site B - Branch - LAN,10.10.30.0/24,fw-b,branch firewall - LAN gateway,10.10.30.1
+Site B - Branch - LAN,10.10.30.0/24,fw-b WAN,tunnel endpoint B,10.10.0.2
+Site B - Branch - LAN,10.10.30.0/24,attacker,branch attacker - rides the VPN,10.10.30.40
+Management - out-of-band,192.168.56.0/24,fw-a,Site A firewall admin,192.168.56.9
+Management - out-of-band,192.168.56.0/24,fw-b,Site B firewall admin,192.168.56.13
+Management - out-of-band,192.168.56.0/24,sensor,admin / SOC access,192.168.56.10
