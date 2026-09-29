@@ -2,6 +2,8 @@
 *.mp4
 *.mov
 *.mkv
+# ...except the short demo clip in assets
+!assets/soc-demo.mp4
 # os / editor cruft
 Thumbs.db
 .DS_Store

@@ -6,6 +6,18 @@ Every phase ends the same way: an attack is run end-to-end, the monitoring stack
 
 > **The through-line:** *Can we see the attack? → across a router? → once a firewall lies with NAT? → once the traffic is encrypted?*
 
+![SOC in action — Grafana network-security dashboard, Wazuh brute-force detection, and the OPNsense firewall live log, all from the lab](assets/soc-in-action.png)
+<sub>Live monitoring from the lab: Suricata alerts in Grafana (left), Wazuh catching an SSH brute-force on the endpoint (bottom-left), and the OPNsense firewall log (right).</sub>
+
+---
+
+## Demo
+
+A short screen-recording of the SOC catching an attack across the monitoring stack: [`assets/soc-demo.mp4`](assets/soc-demo.mp4).
+*(GitHub plays it inline when you open the file; the full theory + practical walkthrough videos are recorded per phase and kept out of the repo for size.)*
+
+![Firewall live log and dashboard](assets/dashboard-firewall-log.png)
+
 ---
 
 ## The four phases
